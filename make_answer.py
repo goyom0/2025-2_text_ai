@@ -20,7 +20,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_huggingface import HuggingFacePipeline, HuggingFaceEmbeddings
 from transformers import AutoTokenizer, pipeline, AutoModelForCausalLM
 import sys
-sys.path.append('/2025-2_text_ai/project')
+sys.path.append('/2025-2_text_ai')
 
 import unicodedata
 
