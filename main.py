@@ -131,7 +131,7 @@ def main():
     
     # model_id = 'meta-llama/Llama-3.2-3B-Instruct'
     model_id = args.model
-    # meta-llama/Meta-Llama-3.2-70B-Instruct
+    # meta-llama/Meta-Llama-3.3-70B-Instruct
 
     temperature = args.temp
 
