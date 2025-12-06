@@ -5,6 +5,8 @@
 # 1. ID 매핑: evaluate_batch_multicandidate 함수에 ids 인자를 추가하여 실제 데이터의 ID(subject_id가 없다면 인덱스)를 사용
 # 2. Rationale 추가: 프롬프트 수정 - 진단명과 함께 근거를 출력하게 하고, 결과 딕셔너리에 rationales 추가 -- 삭제
 # 3. RAG On/Off: hybrid_rag_llm_llm_preprocess 함수에 use_rag 파라미터 추가, False일 경우 검색 과정을 건너뛰고 HPI만 입력받도록 함
+    # Usage: python project_final.py --model meta-llama/Llama-3.2-3B-Instruct (--rag)
+    # --rag 플래그 있으면 rag 실행, 없으면 baseline (rag 없음)
 
 
 import pandas as pd
