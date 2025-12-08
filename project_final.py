@@ -8,11 +8,13 @@
     # Usage: python project_final.py --model meta-llama/Llama-3.2-3B-Instruct (--rag)
     # --rag 플래그 있으면 rag 실행, 없으면 baseline (rag 없음)
 
-
 import pandas as pd
 import numpy as np
 import json
 import re
+import os
+import random
+import argparse
 from tqdm import tqdm
 from collections import Counter
 from itertools import combinations
@@ -22,20 +24,24 @@ from sentence_transformers import SentenceTransformer, util
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from huggingface_hub import login
-import random
+from dotenv import load_dotenv
 
 # === HF 토큰 설정 ===
 HF_TOKEN = input("Enter your Hugging Face token:")
 login(token=HF_TOKEN)
 
+
+# ===== 설정 =====
+load_dotenv()
+HF_TOKEN = os.getenv("HF_TOKEN")
+if HF_TOKEN:
+    login(token=HF_TOKEN)
+
 # === 기본 설정 ===
 CONFIDENCE_THRESHOLD = 0.6
 DATA_PATH = "/home/work/.dahyoun/class/text_ai/project/data/test_data.csv"
-
-# === Semantic 임베딩 ===
-print("Semantic 임베딩 로드 중...")
-embedder = SentenceTransformer('all-MiniLM-L6-v2')
-
+# 이미 rag에 쓸 요약본 있는 경우
+# DATA_PATH = "/home/work/.dahyoun/class/text_ai/project/data/rag.csv"
 
 # === RAG 데이터 전처리 모델 ===
 print("LLM 전처리 모델 로드 중...")
@@ -54,8 +60,9 @@ llm_preprocess_pipe.tokenizer.pad_token_id = llm_preprocess_pipe.tokenizer.eos_t
 llm_preprocess_pipe.model.config.pad_token_id = llm_preprocess_pipe.model.config.eos_token_id
 
 
-
-
+# ==========================================
+# [Helper Functions] 
+# ==========================================
 
 def semantic_similarity(text1, text2):
     try:
@@ -68,361 +75,313 @@ def semantic_similarity(text1, text2):
     except:
         return 0.0
 
-# ===== 3.  전처리 함수들 =====
-
-# diagnosis 정규화
-def normalize_diagnosis(text):
-    """diagnosis를 리스트 형태로 정규화"""
-    if pd.isna(text):
-        return []
-    # 1) 개행, 탭, 중복 공백 정리
-    text = re.sub(r'\s+', ' ', str(text)).strip()
-    # 2) PRIMARY / SECONDARY / etc. 라벨 제거
-    text = re.sub(r'PRIMARY|SECONDARY|PRIMARY DIAGNOSIS|SECONDARY DIAGNOSIS|DIAGNOSIS|Dx|:', 
-                  '', text, flags=re.IGNORECASE)
-    # 3) 번호 or bullet 처리 (- split by numbers "1.", "2)", "-", "•")
-    parts = re.split(r'\d+[\.\)]\s*|[-•]\s*', text)
-    # 4) 빈 항목 제거 & trim
-    parts = [p.strip() for p in parts if p.strip() and len(p.strip()) > 2]
-    return parts
-
-
-def extract_info(text: str):
-    text = str(text)
-    m = re.search(r'Gender:\s*(.*?),\s*Race:\s*(.*?),\s*Age:\s*(\d+)', text)
-    if not m:
-        return None, None, None  # 혹은 기본값 설정
-
-    gender = m.group(1).strip()
-    race   = m.group(2).strip()
-    age    = int(m.group(3))
-    start = (age // 10) * 10   # 54 → 50
-    end   = start + 10         # 50 → 60
-
-    return gender, race, f"{start}-{end}"
-
-
-def llm_summarize_hpi(
-    df, 
-    pipe, 
-    batch_size=8,
-    hpi_col="HPI",
-    diagnosis_col="diagnosis",
-    info_col="patient_info"
-):
-    """
-    DataFrame 전체 전처리:
-    1) LLM HPI 요약(batch 방식)
-    2) diagnosis 정규화
-    3) patient_info 추출
-    """
-
-    # === 1. HPI 요약 프롬프트 ===
-    prompts = [
-        f"""
-        You are a medical expert. Please provide ONLY a concise summary of the patient's History of Present Illness (HPI) in less than 100 words. 
-        Do NOT include any additional text or explanations.
-
-        Patient HPI: {text}
-
-        Summary:"""
-        for text in df[hpi_col].fillna("").astype(str).tolist()
-    ]
-
-    # === 2. Batch inference 실행 ===
-    outputs = pipe(prompts, batch_size=batch_size, truncation=True)
-
-    def extract_summary(g):
-        try:
-            text = g["generated_text"]
-            summary = text.split("Summary:")[-1].strip()
-            words = summary.split()
-            return " ".join(words[:50])
-        except:
-            return ""
-
-    df["llm_hpi_summary"] = [extract_summary(out) for out in outputs]
-    # === 3. diagnosis 정규화 ===
-    df["diagnosis_list"] = df[diagnosis_col].apply(normalize_diagnosis)
-    # === 4. patient_info 추출 ===
-    df["patient_info_extract"] = df[info_col].apply(extract_info)
-
-    return df
-
-
-# BM25 검색 함수들 (LLM 전처리 데이터 사용)
-def bm25_search_diag_only(query_vec, rag_vectors, rag_df, k=15):
-    sims = cosine_similarity(query_vec, rag_vectors).flatten()
-    top_idx = np.argsort(sims)[-k:][::-1]
-    # LLM 추출 진단명들 반환 (리스트)
-    return [diag for sublist in rag_df.iloc[top_idx]['diagnosis_list'] for diag in sublist]
-
-def bm25_search_full(query_vec, rag_vectors, rag_df, k=5):
-    sims = cosine_similarity(query_vec, rag_vectors).flatten()
-    top_idx = np.argsort(sims)[-k:][::-1]
-    return rag_df.iloc[top_idx][['llm_hpi_summary', 'diagnosis_list']].to_dict('records')
-
-def bm25_majority_vote(query_vec, rag_vectors, rag_df,):
-    top_diags = bm25_search_diag_only(query_vec, rag_vectors, rag_df,)
-    return Counter(top_diags).most_common(1)[0][0]
-
-
-def summarize_single_hpi(text, pipe):
-    prompt = f"""
-        You are a medical expert. Provide ONLY a concise summary of the patient's History of Present Illness (HPI) in <50 words.
-
-        Patient HPI: {text}
-
-        Summary:
-    """
-    out = pipe(prompt, max_new_tokens=128, truncation=True)
-
-    if isinstance(out, list):
-        out = out[0]
-
-    # dict or string 모두 처리
-    if isinstance(out, dict):
-        gen = out.get("generated_text", "")
-    else:
-        gen = str(out)
-
-    summary = gen.split("Summary:")[-1].strip()
-    words = summary.split()
-    return " ".join(words[:50])
-
-
-# 기존 후처리 함수
-def validate_llm_output(llm_output):
-    llm_lower = str(llm_output).lower().strip()
-    invalid_keywords = ['unknown', 'cannot', 'insufficient', 'clinician', 'doctor', 
-                       'diagnosis', 'diagnoses', 'primary diagnosis', 
-                    #    'rationale'
-                       ]
-    if any(keyword in llm_lower for keyword in invalid_keywords):
-        return None
-    words = llm_lower.split()
-    if len(words) < 2 or len(llm_lower) < 10:
-        return None
-    medical_keywords = ['fracture', 'pain', 'cholecystitis', 'appendicitis', 'cellulitis',
-                       'pneumonia', 'obstruction', 'chf', 'copd', 'infarction']
-    if not any(keyword in llm_lower for keyword in medical_keywords):
-        return None
-    return llm_output
-
-
-def extract_diagnosis_from_llm_improved(text):
-    text = str(text).lower()
-    patterns = [
-        r'(acute|chronic)\s+(appendicitis|cholecystitis|chf|cellulitis|fracture)',
-        r'(hip|ankle|femur|tibia)\s+(fracture)',
-        r'(abdominal|chest)\s+(pain)',
-        r'\b(cellulitis|pneumonia|obstruction|cholelithiasis)\b'
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            candidate = match.group().strip()
-            validated = validate_llm_output(candidate)
-            if validated:
-                return validated
-    words = re.findall(r'\b[a-z]{5,}\b', text)
-    for word in words:
-        validated = validate_llm_output(word)
-        if validated:
-            return validated
-    return None
-
-
-# LLM 전처리 + 예측 진단명 하이브리드 함수
-def hybrid_rag_llm_llm_preprocess(hpi_text, llm_pipe, vectorizer, rag_vectors, rag_df, threshold=CONFIDENCE_THRESHOLD, use_rag=True):
-    """
-    LLM 전처리 + 다중 후보 하이브리드
-    ### use_rag 옵션 추가 
-    """
-    
-    q_text = summarize_single_hpi(hpi_text, llm_pipe)  # 쿼리도 LLM 요약
-    
-    bm25_candidates = []
-    bm25_diag = None
-    context = ""
-
-    #### RAG 사용 여부 ####
-    if use_rag:
-        # 1. BM25 검색 (LLM 전처리 데이터 사용)
-        q_vec = vectorizer.transform([q_text])
-        bm25_candidates = bm25_search_diag_only(q_vec, k=7)
-        bm25_diag = bm25_majority_vote(q_vec, rag_vectors, rag_df,)
-        # 2. LLM 컨텍스트 생성
-        similar_cases = bm25_search_full(q_vec, rag_vectors, rag_df, k=3)
-        context = "Similar cases:\n" + "\n".join([
-            f"{i+1}. HPI: {case['llm_hpi_summary']} → Diags: {', '.join(case['diagnosis_list'])}" 
-            for i, case in enumerate(similar_cases)
-        ])
-    else:
-        # RAG 미사용 시 컨텍스트 비움
-        context = "No similar cases provided. Diagnose based on HPI only."
-
-    #### Rationale ####
-    # For each diagnosis, provide a brief rationale explaining why.
-    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-        You are a skilled clinician. Provide up to 3 possible diagnoses from HPI.
-
-        Patient HPI: {hpi_text}
-        {context}
-        Format each line as:
-        Diagnoses: [Diagnoses list]
-
-
-        
-        Diagnoses:"""
-            
-    # 3. 진단명 예측
-    llm_candidates = []
-    # llm_rationales = [] # Rationale 저장
-
-    try:
-        llm_outputs = llm_pipe(prompt, num_return_sequences=3)
-        for out in llm_outputs:
-            generated_text = out['generated_text']
-            # 진단명 추출 
-            raw_diag = extract_diagnosis_from_llm_improved(generated_text)
-
-            # # Rationale 추출 
-            # # LLM이 포맷을 지켰다면 "-" 이후가 Rationale, 아니면 전체 텍스트
-            # if "Rationale:" in generated_text:
-            #     rationale_text = generated_text.split("Rationale:")[-1].strip()
-            # else:
-            #     rationale_text = generated_text.strip()
-
-            if raw_diag and raw_diag != "unknown":
-                llm_candidates.append(raw_diag)
-                # llm_rationales.append(rationale_text)
-
-        llm_candidates = list(set(llm_candidates))[:3]
-        # rationales 개수 맞추기 (중복 제거 등으로 개수가 안 맞을 수 있으므로 단순화)
-        if len(llm_rationales) > len(llm_candidates):
-            llm_rationales = llm_rationales[:len(llm_candidates)]
-            
-    except:
-        llm_candidates = ["unknown"]
-        # llm_rationales = ["No rationale generated"]
-    
-    # 4. 하이브리드 앙상블 (RAG 미사용시 BM25 제외)
-    if use_rag:
-        hybrid_candidates = bm25_candidates + llm_candidates * 2
-    else:
-        hybrid_candidates = llm_candidates # RAG 껐을 땐 LLM만
-        
-    candidate_counts = Counter(hybrid_candidates)
-    top_candidates = [c for c, _ in candidate_counts.most_common(5)][:3]
-    
-    # 후보가 비었을 경우 처리
-    if not top_candidates:
-        top_candidates = ["unknown"]
-
-    # 5. 상위 3개 유사도 계산
-    similarity_scores = [semantic_similarity(cand, hpi_text) for cand in top_candidates]
-    
-    # 6. 신뢰도 (최고 유사도 기준)
-    confidence = max(similarity_scores) if similarity_scores else 0.0
-    
-    # 7. 상태 판단
-    if confidence >= threshold:
-        status, action, color = "🟢 HIGH_CONFIDENCE"
-    elif confidence >= 0.45:
-        status, action, color = "🟡 REVIEW_NEEDED"
-    else:
-        status, action, color = "🔴 LOW_CONFIDENCE"
-    
-    return {
-        "diagnosis_candidates": top_candidates,
-        # "rationales": llm_rationales, 
-        "similarity_scores": similarity_scores,
-        "bm25_candidates": bm25_candidates[:3],
-        "llm_candidates": llm_candidates,
-        "bm25_fallback": bm25_diag,
-        "confidence": round(confidence, 3),
-        "status": status,
-        "action": action,
-        "color": color,
-        "hpi_summary": q_text,
-        "hpi": hpi_text[:120] + "...",
-        "use_rag": use_rag
-    }
-
-
-# == 11. LLM 일관성 테스트  (multi diagnoses) ==
-
-def get_all_answers_multicandidate(records, model_func, args, llm_pipe, n: int = 5, use_rag: bool = True):
-    vectorizer, rag_vectors, rag_df = args
-    all_preds = []
-    # all_rationales = []
-    for hpi in records:
-        preds_list = []
-        # rats_list = []
-        for _ in range(n):
-            # use_rag 옵션
-            result = model_func(hpi, llm_pipe, vectorizer, rag_vectors, rag_df, use_rag=use_rag)
-            preds_list.append(result['diagnosis_candidates'])
-            # rats_list.append(result.get('rationales', []))
-        all_preds.append(preds_list)
-        # all_rationales.append(rats_list)
-    # return all_preds, all_rationales
-    return all_preds
-
 def calculate_set_similarity(list1, list2):
-    """
-    [Set-to-Set Similarity]
-    두 리스트가 '구성적으로' 얼마나 유사한지 평가
-    - 정답이 여러 개일 때, 모델이 그걸 다 커버했는지(Recall)
-    - 모델의 예측들이 헛다리 안 짚고 정답과 관련 있는지(Precision)
-    두 가지를 모두 고려하여 평균냄
-    """
+    """Set-to-Set Similarity (Max Pooling Mean)"""
     if not list1 or not list2: return 0.0
     
-    # 1. List1(기준) -> List2(타겟): "List1의 항목들을 List2가 얼마나 잘 커버했나?"
     scores_1_to_2 = []
     for t1 in list1:
-        # t1과 가장 유사한 t2를 찾아서 점수 반영
+        # t1이 list2의 항목 중 가장 비슷한 것과 얼마나 유사한지
         best_score = max([semantic_similarity(t1, t2) for t2 in list2]) if list2 else 0
         scores_1_to_2.append(best_score)
     
-    # 2. List2(기준) -> List1(타겟): "List2의 항목들은 List1과 얼마나 관련있나?"
     scores_2_to_1 = []
     for t2 in list2:
         best_score = max([semantic_similarity(t2, t1) for t1 in list1]) if list1 else 0
         scores_2_to_1.append(best_score)
         
-    # 양방향 평균 (Recall 성격 + Precision 성격)
     return (np.mean(scores_1_to_2) + np.mean(scores_2_to_1)) / 2.0
 
 
-def evaluate_batch_multicandidate(records, trues, ids, model_func, args, pipe, n_repeat=5, use_rag=True):
-    # 1. 먼저 5번 반복(n_repeat) 실행하여 결과 수집
-    # batch_preds 구조: [ [Run1, Run2...], [Run1, Run2...] ... ] (피험자별로 묶여있음)
-    # batch_preds, batch_rationales = get_all_answers_multicandidate(records, model_func, pipe, n=n_repeat, use_rag=use_rag)
-    batch_preds = get_all_answers_multicandidate(records, model_func, args, pipe, n=n_repeat, use_rag=use_rag)
-    
-    results = {} # 최종 저장: { "ID_001": {결과}, "ID_002": {결과} ... }
+def extract_info(text: str):
+    text = str(text)
+    m = re.search(r'Gender:\s*(.*?),\s*Race:\s*(.*?),\s*Age:\s*(\d+)', text)
+    if not m: return None, None, None
+    gender = m.group(1).strip()
+    race   = m.group(2).strip()
+    age    = int(m.group(3))
+    start = (age // 10) * 10
+    end   = start + 10
+    return gender, race, f"{start}-{end}"
 
-    print("\n=== 🔄 CONSISTENCY TEST ===")
+# ==========================================
+# [Improved Extraction Logic] 
+# ==========================================
+
+def validate_llm_output(text):
+    text = str(text).lower().strip()
     
-    # for i, (record_preds_list, record_rats_list, true_diag, patient_id, hpi_text) in tqdm(enumerate(zip(batch_preds, batch_rationales, trues, ids, records))):
-    for i, (record_preds_list, true_diag, patient_id, hpi_text) in tqdm(enumerate(zip(batch_preds, trues, ids, records))):
+    # 1. 전처리: 불필요한 접두어/특수문자 제거
+    # "1. ", "- ", "is ", "the " 제거
+    text = re.sub(r'^[\d\.\-\)\•\s]+', '', text)
+    text = re.sub(r'^(is|the|a|an|possible|likely)\s+', '', text)
+    text = re.sub(r'[^\w\s]', '', text) # 특수문자 제거
+    
+    # 2. 기본 필터 (길이 및 금지어)
+    if len(text) < 3 or len(text) > 60: return None
+    invalid_keywords = [
+        'unknown', 'cannot', 'insufficient', 'clinician', 'doctor', 
+        'diagnosis', 'diagnoses', 'none', 'n/a', 'answer',
+        'rationale', 'explanation', 'evidence', 'subtype', 'reasoning',
+        'history', 'symptoms', 'based on'
+    ]
+    if any(k in text for k in invalid_keywords): return None
+
+    # 3. [복구됨] Medical Keyword Whitelist (허용 단어 목록)
+    # 이 단어들이 포함되어야만 진단명으로 인정 (기존 로직의 핵심)
+    medical_keywords = [
+        # 질병 접미사
+        'itis', 'osis', 'ia', 'oma', 'pathy', 'megaly', 'emia', 
+        # 주요 질병/증상 키워드
+        'pain', 'fracture', 'syndrome', 'disease', 'disorder', 'failure', 'injury',
+        'cancer', 'tumor', 'mass', 'abscess', 'cyst', 'infarction', 'stroke',
+        'pneumonia', 'sepsis', 'anemia', 'delirium', 'leukemia', 'lymphoma',
+        'diabetes', 'hypertension', 'copd', 'chf', 'asthma', 'bleed', 'hemorrhage',
+        'infection', 'effusion', 'embolism', 'sclerosis', 'cirrhosis', 'hepatitis',
+        'calculus', 'stone', 'obstruction', 'ileus', 'hernia', 'ulcer', 'gastritis',
+        'pancreatitis', 'appendicitis', 'cholecystitis', 'uti', 'renal', 'kidney',
+        'liver', 'heart', 'lung', 'brain', 'abdominal', 'chest', 'acute', 'chronic'
+    ]
+    
+    # 텍스트 안에 의학 키워드가 하나라도 있는지 확인
+    if not any(keyword in text for keyword in medical_keywords):
+        return None
         
-        # 정답 포맷팅
-        if not isinstance(true_diag, list):
-            true_diag = [str(true_diag)]
+    return text.strip()
+
+def extract_diagnoses_from_text(text):
+    """
+    텍스트에서 진단명을 리스트로 추출 (여러 개 탐색 + 강력한 검증)
+    """
+    candidates = []
+    text_lower = str(text).lower()
+
+    # 1. 포맷 기반 추출 ("Diagnosis: ...")
+    # 줄바꿈이나 'rationale' 나오기 전까지만 가져옴
+    format_matches = re.findall(r'diagnosis:?\s*(.*?)(?:\s*-\s*rationale|\n|$)', text_lower)
+    if not format_matches:
+        format_matches = re.findall(r'diagnoses:?\s*(.*?)(?:\s*-\s*rationale|\n|$)', text_lower)
         
-        # --- [1] Accuracy (5회 평균) ---
-        acc_scores = []
-        for preds in record_preds_list: 
-            # Set-to-Set 유사도 계산
-            run_score = calculate_set_similarity(preds, true_diag)
-            acc_scores.append(run_score)
+    for match in format_matches:
+        # 콤마로 연결된 경우 분리 (ex: "Pneumonia, UTI")
+        sub_parts = re.split(r',|;', match)
+        for part in sub_parts:
+            valid = validate_llm_output(part)
+            if valid: candidates.append(valid)
+
+    # 2. 리스트/불렛 기반 추출 (1. ..., - ...)
+    if not candidates:
+        list_matches = re.findall(r'(?:^\d+[\.\)]|^[-•\*])\s*(.*?)(?:\n|$|-)', text_lower, re.MULTILINE)
+        for match in list_matches:
+            sub_parts = re.split(r',|;', match)
+            for part in sub_parts:
+                valid = validate_llm_output(part)
+                if valid: candidates.append(valid)
+
+    # 3. 키워드 패턴 매칭
+    if not candidates:
+        # 3-1. 특정 패턴 (acute OO, OO fracture 등)
+        patterns = [
+            r'\b(acute|chronic)\s+([a-z]+)\b',
+            r'\b([a-z]+)\s+(fracture|pain|syndrome|disease|failure)\b',
+            r'\b(pneumonia|sepsis|chf|copd|infarction|anemia|leukemia)\b'
+        ]
+        for pat in patterns:
+            hits = re.findall(pat, text_lower)
+            for hit in hits:
+                if isinstance(hit, tuple): hit = " ".join(hit)
+                valid = validate_llm_output(hit)
+                if valid: candidates.append(valid)
+                
+        # 3-2. 긴 단어(5글자 이상) 중 Medical Keyword 통과하는 것
+        words = re.findall(r'\b[a-z]{5,}(?:\s+[a-z]{3,})*\b', text_lower)
+        for w in words:
+            valid = validate_llm_output(w)
+            if valid: candidates.append(valid)
+
+    return list(set(candidates))
+
+
+def parse_diagnosis_json(text):
+    text = str(text)
+
+    # JSON 배열이 아예 없는 경우
+    if "[" not in text or "]" not in text:
+        return []
+
+    try:
+        # 첫 번째 [ ... ] 부분만 파싱
+        start = text.index("[")
+        end = text.index("]", start) + 1
+        json_str = text[start:end]
+
+        # 작은따옴표 → 큰따옴표 자동변환
+        json_str = json_str.replace("'", '"')
+
+        arr = json.loads(json_str)
+
+        # 문자열만 남기기
+        return [str(x).strip() for x in arr if len(str(x).strip()) > 1]
+    except Exception as e:
+        return []
+
+
+
+# ==========================================
+# [Batch Processing]
+# =========================================
+
+# 1. Dataset 클래스
+class ListDataset(Dataset):
+    def __init__(self, original_list):
+        self.original_list = original_list
+    def __len__(self):
+        return len(self.original_list)
+    def __getitem__(self, i):
+        return self.original_list[i]
+
+# 2. 프롬프트 준비 함수 (Batch 전처리)
+def prepare_prompt_batch(hpi_text, summary_text, vectorizer, rag_vectors, rag_df, use_rag=True):
+    # 요약본 사용
+    q_text = summary_text if summary_text and str(summary_text) != "nan" else hpi_text
+    bm25_candidates = []
+    context = ""
+
+    if use_rag:
+        q_vec = vectorizer.transform([q_text])
+        sims = cosine_similarity(q_vec, rag_vectors).flatten()
+        
+        top_idx_diag = np.argsort(sims)[-7:][::-1]
+        bm25_candidates = [diag for sublist in rag_df.iloc[top_idx_diag]['diagnosis_list'] for diag in sublist]
+        
+        top_idx_full = np.argsort(sims)[-3:][::-1]
+        similar_cases = rag_df.iloc[top_idx_full][['llm_hpi_summary', 'diagnosis_list']].to_dict('records')
+        context = "Here is some similar cases:\n" + "\n".join([
+            f"{i+1}. Patient HPI: {case['llm_hpi_summary']} → Diagnosis: {', '.join(case['diagnosis_list'])}" 
+            for i, case in enumerate(similar_cases)
+        ])
+    else:
+        context = "No similar cases provided."
+
+    # prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+    #     You are a skilled clinician. Provide up to 3 possible diagnoses from HPI.
+        
+    #     Patient HPI: {hpi_text}
+    #     {context}
+
+    #     Diagnoses:"""
+
+
+    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+        You are a skilled clinician. Provide up to 3 possible diagnoses from HPI.
+
+        Return ONLY valid JSON.
+        No explanations. No additional text.
+        Format:["...","...","..."]
+        Similar Cases:
+        {context} \n\n
+
+        Patient HPI:
+        {hpi_text}
+
+        Diagnosis:
+        """
+
+    # prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+    #     You are a skilled clinician. Provide up to 3 possible diagnoses from HPI and similar cases.
+    #     For each diagnosis, provide a brief rationale explaining why.
+    #     Format each line as:
+    #     Diagnosis: [diagnosis] - [rationale]
+
+    #     Patient HPI: {hpi_text}
+    #     {context}
+
+    #     Diagnosis (comma separated):"""
+    
+    meta_data = {"bm25_candidates": bm25_candidates[:3]}
+    return prompt, meta_data
+
+
+def process_llm_output(llm_out, meta_data, use_rag=True):
+    current_candidates = []
+    
+    # 배치 출력은 num_return_sequences=3 이므로 리스트 형태
+    for single_gen in llm_out:
+        generated_text = single_gen['generated_text']
+        # print("\n========== RAW LLM OUTPUT ==========")
+        # print(generated_text)
+        # print("====================================\n")
+        extracted = parse_diagnosis_json(generated_text)
+        current_candidates.extend(extracted)
+
+    if use_rag:
+        hybrid_candidates = meta_data['bm25_candidates'] + current_candidates
+    else:
+        hybrid_candidates = current_candidates
+        
+    if not hybrid_candidates:
+        return ["unknown"]
+        
+    candidate_counts = Counter(hybrid_candidates)
+    top_3 = [c for c, _ in candidate_counts.most_common(5)][:3]
+    return top_3
+
+
+def get_all_answers_multicandidate(records, summaries, vectorizer, rag_vectors, rag_df, pipe, n=5, use_rag=True):
+    print("🔄 [Step 1] Preparing Prompts...")
+    prompts = []
+    meta_datas = []
+    
+    # 길이 맞추기
+    if len(records) != len(summaries):
+        min_len = min(len(records), len(summaries))
+        records = records[:min_len]
+        summaries = summaries[:min_len]
+
+    # 프롬프트 준비
+    for hpi, summ in tqdm(zip(records, summaries), total=len(records)):
+        p, m = prepare_prompt_batch(hpi, summ, vectorizer, rag_vectors, rag_df, use_rag)
+        prompts.append(p)
+        meta_datas.append(m)
+
+    # 🔥 [핵심] 리스트를 Dataset으로 변환
+    dataset = ListDataset(prompts)
+
+    all_preds = [[] for _ in range(len(prompts))]
+    
+    for i in range(n):
+        print(f"🚀 [Step 2] Batch Inference Run {i+1}/{n}")
+        batch_results = []
+        
+        # 🔥 [핵심] pipe에 dataset 전달 -> GPU 효율 극대화
+        # num_return_sequences=3이므로 결과는 [[dict, dict, dict], ...] 형태
+        for out in tqdm(pipe(dataset, batch_size=32, num_return_sequences=3), total=len(dataset)):
+            batch_results.append(out)
+        
+        for idx, (llm_outs) in enumerate(batch_results):
+            top_3 = process_llm_output(llm_outs, meta_datas[idx], use_rag)
+            all_preds[idx].append(top_3)
+            
+    return all_preds
+
+def evaluate_batch_multicandidate(records, summaries, trues, ids, args, pipe, n_repeat=5, use_rag=True):
+    vectorizer, rag_vectors, rag_df = args
+    
+    batch_preds = get_all_answers_multicandidate(records, summaries, vectorizer, rag_vectors, rag_df, pipe, n_repeat, use_rag)
+    
+    results = {}
+    print("🔄 [Step 3] Calculating Metrics...")
+    
+    for i, (record_preds_list, true_diag, patient_id, hpi_text) in tqdm(enumerate(zip(batch_preds, trues, ids, records)), total=len(records)):
+        
+        if not isinstance(true_diag, list): 
+            true_diag = normalize_diagnosis(true_diag)
+            
+        # Accuracy
+        acc_scores = [calculate_set_similarity(preds, true_diag) for preds in record_preds_list]
         semantic_accuracy = float(np.mean(acc_scores))
 
-        # --- [2] Consistency (5회 간 쌍 비교 평균) ---
+        # Consistency
         if len(record_preds_list) > 1:
             from itertools import combinations
             run_pairs = list(combinations(record_preds_list, 2))
@@ -431,58 +390,65 @@ def evaluate_batch_multicandidate(records, trues, ids, model_func, args, pipe, n
         else:
             semantic_consistency = 1.0
             
-        # --- [3] Uncertainty ---
-        semantic_uncertainty = 1.0 - semantic_consistency
-
-        # [저장] ID를 Key로 하여, 해당 피험자의 모든 정보를 하나의 Value로 저장
         results[patient_id] = {
             "patient_id": patient_id,
-            "hpi": hpi_text[:200] + "..." if len(hpi_text) > 200 else hpi_text, # 원문 일부 저장
+            "hpi": hpi_text[:200] + "...",
             "true_diagnosis": true_diag,
-            # 5번의 결과 리스트
             "predictions_per_repeat": record_preds_list, 
-            # "rationales_per_repeat": record_rats_list,
-            # 지표 평균값
             "semantic_accuracy": semantic_accuracy,         
             "semantic_consistency": semantic_consistency,   
-            "semantic_uncertainty": semantic_uncertainty,
+            "semantic_uncertainty": 1.0 - semantic_consistency,
             "use_rag": use_rag
         }
-        
     return results
 
 
-
-
+# ==========================================
+# [Main Execution]
+# ==========================================
 
 def load_main_llm(model_name):
     print("메인 LLM 로드 중...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name, device_map="auto", torch_dtype=torch.float16,
         low_cpu_mem_usage=True
     )
+    model.config.pad_token_id = model.config.eos_token_id
+
     pipe = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
         device_map="auto",
-        max_new_tokens=512,
+        max_new_tokens=256,
         do_sample=True,
         temperature=0.7,
         top_p=0.9,
         top_k=50,
+        return_full_text=False,
+        repetition_penalty=1.3,
+        add_special_tokens=False,
     )
-    pipe.tokenizer.pad_token = pipe.tokenizer.eos_token
-    pipe.tokenizer.pad_token_id = pipe.tokenizer.eos_token_id
-    pipe.model.config.pad_token_id = pipe.model.config.eos_token_id
+    
     return pipe
 
 
 
 
+
+
 def main():
+    import os
     import argparse
+    
+    # 전역 변수 설정 (함수들에서 접근 가능하도록)
+    global embedder
+    
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, required=True)
     ap.add_argument("--rag", action="store_true", help="enable RAG")
@@ -492,93 +458,129 @@ def main():
     np.random.seed(seed); torch.manual_seed(seed); random.seed(seed)
 
     # === 1. 데이터 로드 ===
-    df = pd.read_csv(DATA_PATH)
-    # 실제 ID 컬럼이 있다면 사용하고, 없다면 인덱스를 ID로 보존
+    print("=== Data Load ===")
+    # DATA_PATH = "/home/work/.dahyoun/class/text_ai/project/data/rag.csv"
+    df = pd.read_csv(DATA_PATH, index_col=0)
+    df = df.sort_values(by="stay_id")
+    
+    # ID 컬럼 통일 (stay_id가 없으면 인덱스 사용)
     if 'stay_id' not in df.columns:
-        df['stay_id'] = df.index 
+        df['stay_id'] = df.index.astype(str)
+    
+    # 필수 컬럼 확인 (없으면 에러 방지 위해 임시 생성)
+    if 'llm_hpi_summary' not in df.columns:
+         # === 검색용 텍스트 (HPI 요약 + 진단명 합치기) ====
+        print("=== Start data preprocessing ===")
+        rag_df['search_text'] = rag_df['llm_hpi_summary'] + ' ' + ' ' +  rag_df['patient_info_extract'].apply(
+            lambda x: ' '.join([str(v) for v in x if v]) if isinstance(x, tuple) else str(x)
+        ) + ' ' + rag_df['diagnosis_list'].apply(lambda x: ' '.join(x) if isinstance(x, list) else str(x))
+        test_df['query_text'] = test_df['llm_hpi_summary']
+        print("=== Vectorizer ===")
+        vectorizer = TfidfVectorizer(max_features=3000, stop_words='english', ngram_range=(1,2))
+        rag_vectors = vectorizer.fit_transform(rag_df['search_text'])
+        test_queries = vectorizer.transform(test_df['query_text'])
+        print(f"✅ LLM 전처리 완료: {len(rag_df)} RAG / {len(test_df)} Test")
+
+        # 요약 없이 원본 사용할 경우
+        # print("⚠️ 'llm_hpi_summary' 컬럼이 없어 HPI 원본을 대신 사용합니다.")
+        # df['llm_hpi_summary'] = df['HPI']
+    
+    # patient_info_extract가 없으면 추출 수행
+    if 'patient_info_extract' not in df.columns:
+        print("ℹ️ patient_info 추출 수행 중...")
+        df['patient_info_extract'] = df['patient_info'].apply(extract_info)
 
     df = df.dropna(subset=['HPI','patient_info', 'diagnosis']).reset_index(drop=True)
-    rag_df = df.sample(frac=0.8, random_state=0)
+
+    # df sampling
+    # df = df.sample(frac=0.15, random_state=seed)
+    df = df.sample(n=1000, random_state=seed)
+    
+    # Train/Test 분리
+    rag_df = df.sample(frac=0.8, random_state=seed)
     test_df = df.drop(rag_df.index).reset_index(drop=True)
 
+    # === 2. 임베딩 모델 ===
+    print("Semantic 임베딩 로드 중...")
+    embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
-    # === 4. seperating data ===
-    rag_df = llm_summarize_hpi(rag_df, llm_preprocess_pipe, batch_size=8)
-    test_df = llm_summarize_hpi(test_df, llm_preprocess_pipe, batch_size=8)
-
-
-    # === 5. 검색용 텍스트 (HPI 요약 + 진단명 합치기) ====
-    rag_df['search_text'] = rag_df['llm_hpi_summary'] + ' ' + ' ' +  rag_df['patient_info_extract'].apply(
+    # === 3. 검색용 인덱스 생성 ===
+    print("=== Start data preprocessing ===")
+    # 정규화
+    rag_df['diagnosis_list'] = rag_df['diagnosis'].apply(normalize_diagnosis)
+    test_df['diagnosis_list'] = test_df['diagnosis'].apply(normalize_diagnosis)
+    
+    # 검색 텍스트 생성
+    rag_df['search_text'] = rag_df['llm_hpi_summary'].astype(str) + ' ' + rag_df['patient_info_extract'].apply(
         lambda x: ' '.join([str(v) for v in x if v]) if isinstance(x, tuple) else str(x)
     ) + ' ' + rag_df['diagnosis_list'].apply(lambda x: ' '.join(x) if isinstance(x, list) else str(x))
-    test_df['query_text'] = test_df['llm_hpi_summary']
 
+    print("=== Vectorizer ===")
     vectorizer = TfidfVectorizer(max_features=3000, stop_words='english', ngram_range=(1,2))
     rag_vectors = vectorizer.fit_transform(rag_df['search_text'])
-    test_queries = vectorizer.transform(test_df['query_text'])
 
-    print(f"✅ LLM 전처리 완료: {len(rag_df)} RAG / {len(test_df)} Test")
+    print(f"✅ RAG 준비 완료: {len(rag_df)} docs")
 
+    # === 4. 메인 LLM 로드 ===
+    # args.model 이름에 따라 로드
+    model_path = f"/home/work/.dahyoun/class/text_ai/project/models/{args.model}"
+    
+    # 만약 경로가 없으면 Hugging Face ID로 가정
+    if not os.path.exists(model_path):
+        model_path = args.model 
+        
+    # print(f"메인 LLM 로드 중: {model_path}")
+    llm_pipe = load_main_llm(model_path) # 사용자가 정의한 함수 사용
 
-    # === 6. 메인 LLM 로드 (진단명 예측) ===
-    print("메인 LLM 로드 중...")
-    # model_name = "FreedomIntelligence/HuatuoGPT-o1-8B"
-    model_name = args.model
-    llm_pipe = load_main_llm(model_name)
-
+    # === 5. Test 시작 ===
     try:
-        # === 7. Test 시작 ===
+        print("=== Start Test ===")
         test_subset = test_df 
         hpi_samples = test_subset['HPI'].tolist()
         true_samples = test_subset['diagnosis_list'].tolist()
-        id_samples = test_subset['stay_id'].tolist() 
+        id_samples = test_subset['stay_id'].tolist() # stay_id 사용 통일
+        
+        # 요약본 리스트 추출
+        test_summaries = test_subset['llm_hpi_summary'].fillna("").astype(str).tolist()
 
-        # RAG 사용 여부 설정 (True or False)
         USE_RAG_OPTION = args.rag 
+        if USE_RAG_OPTION:
+            print("Using RAG!")
 
+        # 평가 함수 호출 (인자 매칭 완료)
         results = evaluate_batch_multicandidate(
-            hpi_samples, 
-            true_samples, 
-            id_samples, 
-            hybrid_rag_llm_llm_preprocess, 
+            records=hpi_samples, 
+            summaries=test_summaries,
+            trues=true_samples, 
+            ids=id_samples, 
             args=(vectorizer, rag_vectors, rag_df),
-            pipe=llm_pipe,
+            pipe=llm_pipe, 
             n_repeat=5, 
             use_rag=USE_RAG_OPTION
         )
 
     finally:
         print("=" * 80)
-        # output 예시
-        for idx in list(results.keys())[:5]:
-            res = results[idx]
+        if 'results' in locals() and results:
+            # Output preview
+            first_key = list(results.keys())[0]
+            res = results[first_key]
             print(f"   Patient ID: {res['patient_id']}")
             print(f"   True: {res['true_diagnosis']}")
-            print(f"   🔹 Accuracy: {res['semantic_accuracy']:.3f}")
-            print(f"   🔹 Consistency: {res['semantic_consistency']:.3f}")
-            print(f"   🔹 Uncertainty: {res['semantic_uncertainty']:.3f}")
             print(f"   Prediction: {res['predictions_per_repeat'][0]}")
-            # if res['rationales_per_repeat'][0]:
-            #     print(f"   💡 Rationale: {res['rationales_per_repeat'][0][0][:100]}...")
-            print()
+            print(f"   *** Accuracy: {res['semantic_accuracy']:.3f}")
+            
+            M = args.model.split('/')[-1].replace("-", "_")
+            rag_str = 'rag' if args.rag else 'base'
+            
+            savedir = "/home/work/.dahyoun/class/text_ai/project/final_result"
+            os.makedirs(savedir, exist_ok=True)
+            output_path = f"{savedir}/{M}_{rag_str}_results.json"
 
-        M = model_name.split('/')[-1].replace("-", "_")
-        if args.rag==True:
-            rag = 'rag'
-        else:
-            rag = 'base'
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
 
-        import os
-        savedir = "/home/work/.dahyoun/class/text_ai/project/final_result"
-        os.makedir(savedir, exist_ok=True)
-        output_path = f"{savedir}/{M}_{rag}_results.json"
-
-        import json
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-
-        print(f"💾 JSON 저장 완료: {output_path}")
-
+            print(f"💾 JSON 저장 완료: {output_path}")
 
 
 
