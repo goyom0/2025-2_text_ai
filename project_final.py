@@ -31,12 +31,6 @@ HF_TOKEN = input("Enter your Hugging Face token:")
 login(token=HF_TOKEN)
 
 
-# ===== 설정 =====
-load_dotenv()
-HF_TOKEN = os.getenv("HF_TOKEN")
-if HF_TOKEN:
-    login(token=HF_TOKEN)
-
 # === 기본 설정 ===
 CONFIDENCE_THRESHOLD = 0.6
 DATA_PATH = "/home/work/.dahyoun/class/text_ai/project/data/test_data.csv"
