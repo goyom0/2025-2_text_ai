@@ -4,7 +4,7 @@
 
 # 1. ID 매핑: evaluate_batch_multicandidate 함수에 ids 인자를 추가하여 실제 데이터의 ID(subject_id가 없다면 인덱스)를 사용
 # 2. Rationale 추가: 프롬프트 수정 - 진단명과 함께 근거를 출력하게 하고, 결과 딕셔너리에 rationales 추가 -- 삭제
-# 3. RAG On/Off: hybrid_rag_llm_llm_preprocess 함수에 use_rag 파라미터 추가, False일 경우 검색 과정을 건너뛰고 HPI만 입력받도록 함
+# 3. RAG On/Off: use_rag 추가, False일 경우 검색 과정을 건너뛰고 HPI만 입력받도록 함
     # Usage: python project_final.py --model meta-llama/Llama-3.2-3B-Instruct (--rag)
     # --rag 플래그 있으면 rag 실행, 없으면 baseline (rag 없음)
 
@@ -42,6 +42,10 @@ CONFIDENCE_THRESHOLD = 0.6
 DATA_PATH = "/home/work/.dahyoun/class/text_ai/project/data/test_data.csv"
 # 이미 rag에 쓸 요약본 있는 경우
 # DATA_PATH = "/home/work/.dahyoun/class/text_ai/project/data/rag.csv"
+
+# === Semantic 임베딩 ===
+print("Semantic 임베딩 로드 중...")
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
 # === RAG 데이터 전처리 모델 ===
 print("LLM 전처리 모델 로드 중...")
@@ -263,15 +267,6 @@ def prepare_prompt_batch(hpi_text, summary_text, vectorizer, rag_vectors, rag_df
     else:
         context = "No similar cases provided."
 
-    # prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-    #     You are a skilled clinician. Provide up to 3 possible diagnoses from HPI.
-        
-    #     Patient HPI: {hpi_text}
-    #     {context}
-
-    #     Diagnoses:"""
-
-
     prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
         You are a skilled clinician. Provide up to 3 possible diagnoses from HPI.
 
@@ -286,17 +281,6 @@ def prepare_prompt_batch(hpi_text, summary_text, vectorizer, rag_vectors, rag_df
 
         Diagnosis:
         """
-
-    # prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-    #     You are a skilled clinician. Provide up to 3 possible diagnoses from HPI and similar cases.
-    #     For each diagnosis, provide a brief rationale explaining why.
-    #     Format each line as:
-    #     Diagnosis: [diagnosis] - [rationale]
-
-    #     Patient HPI: {hpi_text}
-    #     {context}
-
-    #     Diagnosis (comma separated):"""
     
     meta_data = {"bm25_candidates": bm25_candidates[:3]}
     return prompt, meta_data
@@ -344,7 +328,7 @@ def get_all_answers_multicandidate(records, summaries, vectorizer, rag_vectors, 
         prompts.append(p)
         meta_datas.append(m)
 
-    # 🔥 [핵심] 리스트를 Dataset으로 변환
+    # 리스트를 Dataset으로 변환
     dataset = ListDataset(prompts)
 
     all_preds = [[] for _ in range(len(prompts))]
@@ -353,7 +337,7 @@ def get_all_answers_multicandidate(records, summaries, vectorizer, rag_vectors, 
         print(f"🚀 [Step 2] Batch Inference Run {i+1}/{n}")
         batch_results = []
         
-        # 🔥 [핵심] pipe에 dataset 전달 -> GPU 효율 극대화
+        # pipe에 dataset 전달
         # num_return_sequences=3이므로 결과는 [[dict, dict, dict], ...] 형태
         for out in tqdm(pipe(dataset, batch_size=32, num_return_sequences=3), total=len(dataset)):
             batch_results.append(out)
@@ -363,6 +347,7 @@ def get_all_answers_multicandidate(records, summaries, vectorizer, rag_vectors, 
             all_preds[idx].append(top_3)
             
     return all_preds
+
 
 def evaluate_batch_multicandidate(records, summaries, trues, ids, args, pipe, n_repeat=5, use_rag=True):
     vectorizer, rag_vectors, rag_df = args
@@ -446,7 +431,6 @@ def main():
     import os
     import argparse
     
-    # 전역 변수 설정 (함수들에서 접근 가능하도록)
     global embedder
     
     ap = argparse.ArgumentParser()
@@ -466,29 +450,6 @@ def main():
     # ID 컬럼 통일 (stay_id가 없으면 인덱스 사용)
     if 'stay_id' not in df.columns:
         df['stay_id'] = df.index.astype(str)
-    
-    # 필수 컬럼 확인 (없으면 에러 방지 위해 임시 생성)
-    if 'llm_hpi_summary' not in df.columns:
-         # === 검색용 텍스트 (HPI 요약 + 진단명 합치기) ====
-        print("=== Start data preprocessing ===")
-        rag_df['search_text'] = rag_df['llm_hpi_summary'] + ' ' + ' ' +  rag_df['patient_info_extract'].apply(
-            lambda x: ' '.join([str(v) for v in x if v]) if isinstance(x, tuple) else str(x)
-        ) + ' ' + rag_df['diagnosis_list'].apply(lambda x: ' '.join(x) if isinstance(x, list) else str(x))
-        test_df['query_text'] = test_df['llm_hpi_summary']
-        print("=== Vectorizer ===")
-        vectorizer = TfidfVectorizer(max_features=3000, stop_words='english', ngram_range=(1,2))
-        rag_vectors = vectorizer.fit_transform(rag_df['search_text'])
-        test_queries = vectorizer.transform(test_df['query_text'])
-        print(f"✅ LLM 전처리 완료: {len(rag_df)} RAG / {len(test_df)} Test")
-
-        # 요약 없이 원본 사용할 경우
-        # print("⚠️ 'llm_hpi_summary' 컬럼이 없어 HPI 원본을 대신 사용합니다.")
-        # df['llm_hpi_summary'] = df['HPI']
-    
-    # patient_info_extract가 없으면 추출 수행
-    if 'patient_info_extract' not in df.columns:
-        print("ℹ️ patient_info 추출 수행 중...")
-        df['patient_info_extract'] = df['patient_info'].apply(extract_info)
 
     df = df.dropna(subset=['HPI','patient_info', 'diagnosis']).reset_index(drop=True)
 
@@ -500,11 +461,34 @@ def main():
     rag_df = df.sample(frac=0.8, random_state=seed)
     test_df = df.drop(rag_df.index).reset_index(drop=True)
 
-    # === 2. 임베딩 모델 ===
-    print("Semantic 임베딩 로드 중...")
-    embedder = SentenceTransformer('all-MiniLM-L6-v2')
+    
+    # 필수 컬럼 확인 (없으면 에러 방지 위해 임시 생성)
+    if 'llm_hpi_summary' not in df.columns:
+        # === 검색용 텍스트 (HPI 요약 + 진단명 합치기) ====    
+        print("=== Start data preprocessing ===")
+        rag_df['search_text'] = rag_df['llm_hpi_summary'] + ' ' + ' ' +  rag_df['patient_info_extract'].apply(
+            lambda x: ' '.join([str(v) for v in x if v]) if isinstance(x, tuple) else str(x)
+        ) + ' ' + rag_df['diagnosis_list'].apply(lambda x: ' '.join(x) if isinstance(x, list) else str(x))
+        test_df['query_text'] = test_df['llm_hpi_summary']
+        
+        print("=== Vectorizer ===")
+        vectorizer = TfidfVectorizer(max_features=3000, stop_words='english', ngram_range=(1,2))
+        rag_vectors = vectorizer.fit_transform(rag_df['search_text'])
+        test_queries = vectorizer.transform(test_df['query_text'])
+        
+        print(f"✅ LLM 전처리 완료: {len(rag_df)} RAG / {len(test_df)} Test")
 
-    # === 3. 검색용 인덱스 생성 ===
+        # 요약 없이 원본 사용할 경우
+        # print("⚠️ 'llm_hpi_summary' 컬럼이 없어 HPI 원본을 대신 사용합니다.")
+        # df['llm_hpi_summary'] = df['HPI']
+    
+    # patient_info_extract가 없으면 추출 수행
+    if 'patient_info_extract' not in df.columns:
+        print("ℹ️ patient_info 추출 수행 중...")
+        df['patient_info_extract'] = df['patient_info'].apply(extract_info)
+
+
+    # === 검색용 인덱스 생성 ===
     print("=== Start data preprocessing ===")
     # 정규화
     rag_df['diagnosis_list'] = rag_df['diagnosis'].apply(normalize_diagnosis)
@@ -522,15 +506,10 @@ def main():
     print(f"✅ RAG 준비 완료: {len(rag_df)} docs")
 
     # === 4. 메인 LLM 로드 ===
-    # args.model 이름에 따라 로드
-    model_path = f"/home/work/.dahyoun/class/text_ai/project/models/{args.model}"
-    
-    # 만약 경로가 없으면 Hugging Face ID로 가정
-    if not os.path.exists(model_path):
-        model_path = args.model 
+    model_path = args.model 
         
     # print(f"메인 LLM 로드 중: {model_path}")
-    llm_pipe = load_main_llm(model_path) # 사용자가 정의한 함수 사용
+    llm_pipe = load_main_llm(model_path)
 
     # === 5. Test 시작 ===
     try:
@@ -547,7 +526,7 @@ def main():
         if USE_RAG_OPTION:
             print("Using RAG!")
 
-        # 평가 함수 호출 (인자 매칭 완료)
+        # 평가 함수 호출
         results = evaluate_batch_multicandidate(
             records=hpi_samples, 
             summaries=test_summaries,
